@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>EPUB Unused Image & Pixel Checker (Browser)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    .row { margin-bottom: 12px; }
+    .status { color: #096; margin-top: 8px; }
+    .error  { color: #900; }
+    .mono   { font-family: ui-monospace, Menlo, Consolas, Monaco, monospace; white-space: pre-wrap; }
+    button { padding: 8px 12px; }
+    progress { width: 100%; height: 18px; }
+    .footer { margin-top: 24px; color: #666; font-size: 12px; }
+    .hint { color: #555; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>EPUB Unused Image & Pixel Checker</h1>
+
+  <div class="row">
+    <button id="chooseFolderBtn">Choose EPUB folder (one-time)</button>
+    <span class="hint" id="folderHint">No folder selected.</span>
+  </div>
+
+  <div class="row">
+    <label for="epubFile"><strong>Select EPUB file:</strong></label>
+    <input id="epubFile" type="file" accept=".epub">
+    <button id="runBtn" disabled>Run Check</button>
+  </div>
+
+  <div class="row"><progress id="prog" value="0" max="100" style="display:none"></progress></div>
+
+  <div id="status" class="status">Ready.</div>
+  <div id="error" class="error"></div>
+  <div id="summary" class="mono"></div>
+
+  <div class="footer">
+    Processing is 100% client-side; your EPUB never leaves the browser.<br>
+    <span class="hint">Saving beside the EPUB requires a Chromium-based browser and <b>HTTPS</b> or <b>localhost</b>. The folder permission is remembered after the first selection.</span>
+  </div>
+
+  <!-- Prefer local JSZip (mounted in container); fallback to CDN if missing -->
+  <script src="./jszip.min.js"></script>
+  <script>
+    if (typeof JSZip === 'undefined') {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+      document.head.appendChild(s);
+    }
+  </script>
+
+  <script>
+    // ====== Settings matching your Python tool ======
+    const PIXEL_LIMIT = 5600000; // >= 5,600,000 pixels
+    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif'];
+
+    // ====== Elements ======
+    const chooseFolderBtn = document.getElementById('chooseFolderBtn');
+    const folderHint      = document.getElementById('folderHint');
+    const epubInput       = document.getElementById('epubFile');
+    const runBtn          = document.getElementById('runBtn');
+    const statusEl        = document.getElementById('status');
+    const errorEl         = document.getElementById('error');
+    const progEl          = document.getElementById('prog');
+    const summaryEl       = document.getElementById('summary');
+
+    // ====== State ======
+    let dirHandle = null; // persistent directory handle for saving next to EPUB
+
+    epubInput.addEventListener('change', () => {
+      runBtn.disabled = !epubInput.files.length;
+      summaryEl.textContent = '';
+      statusEl.textContent = 'Ready.';
+      errorEl.textContent = '';
+    });
+
+    // ====== IndexedDB helpers to persist directory handle ======
+    const DB_NAME = 'epub-checker-db';
+    const STORE = 'handles';
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+    async function putHandle(key, handle) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        tx.objectStore(STORE).put(handle, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    async function getHandle(key) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readonly');
+        const req = tx.objectStore(STORE).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function refreshFolderHint() {
+      try {
+        if (!dirHandle) dirHandle = await getHandle('epubDir');
+        if (dirHandle) {
+          const perm = await dirHandle.queryPermission({ mode: 'readwrite' });
+          folderHint.textContent = perm === 'granted' ? `Folder ready: ${dirHandle.name}` : 'Folder selected (permission pending)';
+        } else {
+          folderHint.textContent = 'No folder selected.';
+        }
+      } catch { folderHint.textContent = 'No folder selected.'; }
+    }
+
+    // ====== Choose folder (one-time) ======
+    chooseFolderBtn.addEventListener('click', async () => {
+      errorEl.textContent = '';
+      try {
+        if (!('showDirectoryPicker' in window)) {
+          throw new Error('This feature requires HTTPS/localhost in a Chromium-based browser.');
+        }
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        const requested = await handle.requestPermission({ mode: 'readwrite' });
+        if (requested !== 'granted') throw new Error('Permission not granted.');
+        dirHandle = handle;
+        await putHandle('epubDir', dirHandle);
+        await refreshFolderHint();
+      } catch (e) {
+        errorEl.textContent = e.message || e;
+      }
+    });
+
+    // ====== Run check ======
+    runBtn.addEventListener('click', async () => {
+      errorEl.textContent = '';
+      summaryEl.textContent = '';
+
+      const file = epubInput.files[0];
+      if (!file || !file.name.toLowerCase().endsWith('.epub')) {
+        errorEl.textContent = 'Please choose a valid .epub file.';
+        return;
+      }
+      try { await refreshFolderHint(); } catch {}
+      if (!dirHandle) {
+        errorEl.textContent = 'Choose the EPUB folder first (one-time).';
+        return;
+      }
+
+      runBtn.disabled = true;
+      progEl.style.display = 'block';
+      statusEl.textContent = 'Processing… please wait.';
+
+      try {
+        // Generate report
+        const { reportText, reportName } = await checkEpubImages(file);
+
+        // Find the selected EPUB by filename inside the chosen folder (recursively)
+        const match = await findFileByName(dirHandle, file.name);
+        if (!match) {
+          throw new Error(`Selected EPUB not found inside folder "${dirHandle.name}". Pick the folder that contains ${file.name}.`);
+        }
+        // Save report next to the matched EPUB
+        await saveReport(match.parentDir, reportName, reportText);
+
+        summaryEl.textContent = `Saved: ${match.relativePath.replace(/\\/g,'/').replace(/\/\//g,'/').replace(/\/\//g,'/').replace(/\/\//g,'/')}`.replace(/\n/g,'') + `\nReport: ${reportName}`;
+        statusEl.textContent = 'Completed successfully.';
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = 'Failed.';
+        errorEl.textContent = (e && e.message) ? e.message : 'An unknown error occurred.';
+      } finally {
+        progEl.style.display = 'none';
+        runBtn.disabled = false;
+      }
+    });
+
+    async function saveReport(dirHandle, filename, text) {
+      const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+      await writable.close();
+    }
+
+    // ====== Recursive search for a filename ======
+    async function findFileByName(rootDir, targetName) {
+      targetName = targetName.toLowerCase();
+      async function walk(dirHandle, basePath) {
+        for await (const entry of dirHandle.values()) {
+          const entryPath = basePath ? basePath + '/' + entry.name : entry.name;
+          if (entry.kind === 'file') {
+            if (entry.name.toLowerCase() === targetName) {
+              return { fileHandle: entry, parentDir: dirHandle, relativePath: entryPath };
+            }
+          } else if (entry.kind === 'directory') {
+            const sub = await dirHandle.getDirectoryHandle(entry.name);
+            const found = await walk(sub, entryPath);
+            if (found) return found;
+          }
+        }
+        return null;
+      }
+      return await walk(rootDir, '');
+    }
+
+    // ====== Core logic: mirrors your Python validator ======
+    async function checkEpubImages(epubFile) {
+      const buf = await epubFile.arrayBuffer();
+      const zip = await JSZip.loadAsync(buf);
+
+      const entries = Object.values(zip.files).filter(f => !f.dir).map(f => f.name);
+
+      const containerPath = 'META-INF/container.xml';
+      let contentRoot = '';
+      if (entries.includes(containerPath)) {
+        try {
+          const xmlText = await zip.file(containerPath).async('string');
+          contentRoot = readOpfDirFromContainer(xmlText) || '';
+        } catch {}
+      }
+
+      let xhtmlAggregate = '';
+      const xhtmlFiles = entries.filter(n => n.toLowerCase().endsWith('.xhtml'));
+      for (const n of xhtmlFiles) {
+        try { xhtmlAggregate += (await zip.file(n).async('string')).toLowerCase(); } catch {}
+      }
+
+      const imageCandidates = entries.filter(n => {
+        const parts = n.split('/').map(p => p.toLowerCase());
+        const hasImagesComponent = parts.includes('images');
+        const isImage = IMAGE_EXTS.some(ext => n.toLowerCase().endsWith(ext));
+        return hasImagesComponent && isImage;
+      });
+
+      const unreferenced = [];
+      const oversized    = [];
+
+      const toRelPath = (fullPath, opfDir) => {
+        if (!opfDir) return fullPath;
+        const norm = fullPath.replace(/\\/g, '/').replace(/^\.\/+/, '');
+        const opf  = opfDir.replace(/\\/g, '/').replace(/^\.\/+/, '');
+        if (norm.startsWith(opf)) {
+          const rel = norm.slice(opf.length).replace(/^\/+/, '');
+          return rel || '';
+        }
+        const normParts = norm.split('/');
+        const opfParts  = opf.split('/');
+        let i = 0;
+        while (i < normParts.length && i < opfParts.length && normParts[i] === opfParts[i]) i++;
+        const up = new Array(Math.max(opfParts.length - i, 0)).fill('..');
+        const down = normParts.slice(i);
+        return [...up, ...down].join('/');
+      };
+
+      const encodeRel = (rel) => encodeURI(rel).replace(/#/g, '%23').replace(/\?/g, '%3F');
+
+      async function getImageSizeFromZipPath(path) {
+        const b = await zip.file(path).async('blob');
+        const url = URL.createObjectURL(b);
+        try { return await loadImage(url); } finally { URL.revokeObjectURL(url); }
+      }
+      function loadImage(url) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+          img.onerror = () => reject(new Error('Image decode failed for ' + url));
+          img.src = url;
+        });
+      }
+
+      for (const fullPath of imageCandidates) {
+        const rel = toRelPath(fullPath, contentRoot);
+        const relLower = rel.toLowerCase();
+        const relEncLower = encodeRel(rel).toLowerCase();
+        const isUsed = xhtmlAggregate.includes(relLower) || xhtmlAggregate.includes(relEncLower);
+        if (!isUsed) unreferenced.push({ file: basename(fullPath), rel });
+
+        try {
+          const { width, height } = await getImageSizeFromZipPath(fullPath);
+          const px = width * height;
+          if (px >= PIXEL_LIMIT) {
+            oversized.push({ file: basename(fullPath), rel, w: width, h: height, px });
+          }
+        } catch {}
+      }
+
+      const baseName = epubFile.name.replace(/\.epub$/i, '');
+      const reportName = `${baseName}_image_check.txt`;
+
+      let reportText = '';
+      reportText += `**Unused Images in 'images' Folder**\n`;
+      if (unreferenced.length) {
+        unreferenced.forEach((item, i) => { reportText += `${i + 1}. ${item.file} - ${item.rel}\n`; });
+      } else { reportText += 'None\n'; }
+      reportText += '\n';
+      reportText += `**Images Exceeding Pixel Limit (>= 5,600,000 pixels)**\n`;
+      if (oversized.length) {
+        oversized.forEach((item, i) => { reportText += `${i + 1}. ${item.file}: ${item.w}x${item.h} = ${item.px} pixels - ${item.rel}\n`; });
+      } else { reportText += 'None\n'; }
+
+      return { reportText, reportName };
+    }
+
+    function readOpfDirFromContainer(xmlText) {
+      try {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(xmlText, 'application/xml');
+        const rootfiles = doc.getElementsByTagName('rootfile');
+        if (rootfiles.length) {
+          const fullPath = (rootfiles[0].getAttribute('full-path') || '').trim();
+          if (fullPath) return dirname(fullPath);
+        }
+      } catch {}
+      return '';
+    }
+
+    function dirname(p)  { const idx = p.replace(/\\/g, '/').lastIndexOf('/'); return idx >= 0 ? p.slice(0, idx) : ''; }
+    function basename(p) { const parts = p.replace(/\\/g, '/').split('/'); return parts[parts.length - 1] || p; }
+
+    // Initialize folder hint from stored handle
+    refreshFolderHint();
+  </script>
+</body>
+</html>
