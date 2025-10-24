@@ -1,0 +1,4 @@
+yourdomain.com {
+    reverse_proxy epub-image-checker:80
+    encode gzip
+}
